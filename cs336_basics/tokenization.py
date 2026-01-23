@@ -1,75 +1,156 @@
-"""
-BPE (Byte Pair Encoding) Tokenizer 实现
-"""
-
 import os
+from typing import BinaryIO
 import regex as re
 from collections import defaultdict, Counter
-from cs336_basics.pretokenization import PAT, pretokenization
+from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import cpu_count
+
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+def find_chunk_boundaries(
+    file: BinaryIO,
+    desired_num_chunks: int,
+    split_special_token: bytes,
+) -> list[int]:
+    """
+    Chunk the file into parts that can be counted independently.
+    May return fewer chunks if the boundaries end up overlapping.
+    """
+    assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
+
+    # Get total file size in bytes
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    chunk_size = file_size // desired_num_chunks
+
+    # Initial guesses for chunk boundary locations, uniformly spaced
+    # Chunks start on previous index, don't include last index
+    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+    chunk_boundaries[-1] = file_size
+
+    mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
+
+    for bi in range(1, len(chunk_boundaries) - 1):
+        initial_position = chunk_boundaries[bi]
+        file.seek(initial_position)  # Start at boundary guess
+        while True:
+            mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
+
+            # If EOF, this boundary should be at the end of the file
+            if mini_chunk == b"":
+                chunk_boundaries[bi] = file_size
+                break
+
+            # Find the special token in the mini chunk
+            found_at = mini_chunk.find(split_special_token)
+            if found_at != -1:
+                chunk_boundaries[bi] = initial_position + found_at
+                break
+            initial_position += mini_chunk_size
+
+    # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
+    return sorted(set(chunk_boundaries))
+
+def get_pretokenized_text_counts(text : str) -> Counter[str]:
+    """
+    Pre-tokenize the input text and return a count of each pre-token.
+    """
+    pattern = re.compile(PAT, flags=re.UNICODE)
+    count = Counter()
+    for token in pattern.finditer(text):
+        count[token.group(0)] += 1
+    return count
+
+def pretokenization(
+    input_path : str | os.PathLike,
+    special_tokens: list[str],
+    num_processes : int = 4
+)-> Counter[str]:
+    with open(input_path, 'rb') as f:
+        num_processes = 4
+        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
+        num_workers = min(cpu_count(), num_processes)
+        special_tokens = [re.escape(token) for token in special_tokens]
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = []
+            for start, end in zip(boundaries[:-1], boundaries[1:]):
+                f.seek(start)
+                text = f.read(end - start).decode('utf-8', errors='ignore')
+                if special_tokens:
+                    chunks = re.split("|".join(special_tokens), text, flags=re.UNICODE)
+                else:
+                    chunks = [text]
+                for chunk in chunks:
+                    futures.append(executor.submit(get_pretokenized_text_counts, chunk))
+            total_count = Counter()
+            for future in futures:
+                total_count.update(future.result())
+    return total_count
 
 
-def train_bpe(
-    input_path: str | os.PathLike,
+def train_bpe_tokenizer(
+    input_path : str | os.PathLike,
     vocab_size: int,
     special_tokens: list[str] | None = None,
-    num_processes: int = 4,
-) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    """训练BPE tokenizer"""
+    num_process: int = 4,
+):
     special_tokens = special_tokens or []
     
     # Step 1: 读取文件并预分词
     total_count = pretokenization(
         input_path,
-        num_processes=num_processes,
         special_tokens=special_tokens,
+        num_processes=num_process,
     )
     
     # Step 2: 转换为bytes列表形式
-    words: list[list[bytes]] = [] # 每个word是bytes的列表
+    words: list[list[bytes]] = [] # 每个word是bytes列表
     word_freqs: list[int] = [] # 每个word的频率
-    pair_to_words: dict[tuple[bytes, bytes], set[int]] = defaultdict(set) # pair到包含该pair的word_ids映射
-    pair_counts: dict[tuple[bytes, bytes], int] = defaultdict(int) # pair的总频率
-    
+    pair_in_words: defaultdict[tuple[bytes, bytes], set[int]] = defaultdict(set) # pair到包含该pair的word_ids映射
+    pair_counts: defaultdict[tuple[bytes, bytes], int] = defaultdict(int) # pair的总频率
+        
     for word, count in total_count.items():
-        word_bytes = [bytes([b]) for b in word.encode("utf-8")]
+        word_bytes = [bytes([b]) for b in word.encode('utf-8')]
         word_id = len(words)
         words.append(word_bytes)
         word_freqs.append(count)
         
         for i in range(len(word_bytes) - 1):
-            pair = (word_bytes[i], word_bytes[i + 1])
-            pair_to_words[pair].add(word_id)
+            pair = (word_bytes[i], word_bytes[i+1])
             pair_counts[pair] += count
+            pair_in_words[pair].add(word_id)
     
     # Step 3: 初始化词表
     vocab: dict[int, bytes] = {}
-    token_id = 0    
+    token_id: int = 0
     for i in range(256):
         vocab[token_id] = bytes([i])
         token_id += 1
+    
     for st in special_tokens:
-        vocab[token_id] = st.encode("utf-8")
-        token_id += 1    
+        vocab[token_id] = st.encode('utf-8')
+        token_id += 1
     
     # Step 4: 迭代合并
     merges: list[tuple[bytes, bytes]] = []
-    
     while token_id < vocab_size and pair_counts:
         # 找最高频的pair (使用字典序作为tie-breaker)
-        best_pair = max(pair_counts, key=lambda p: (pair_counts[p], p))
-        best_count = pair_counts[best_pair]
+        most_pair = max(pair_counts, key = lambda p:(pair_counts[p], p))
+        most_count = pair_counts[most_pair]
         
-        if best_count <= 0:
+        if most_count <= 0:
             break
         
-        new_token = best_pair[0] + best_pair[1]
-        merges.append(best_pair)
+        new_token = most_pair[0] + most_pair[1]
+        merges.append(most_pair)
         vocab[token_id] = new_token
         token_id += 1
         
         # 获取包含这个pair的所有word_ids
-        affected_word_ids = pair_to_words.pop(best_pair, set())
-        del pair_counts[best_pair]
+        affected_word_ids = pair_in_words.pop(most_pair, set())
+        del pair_counts[most_pair]
         
         for word_id in affected_word_ids:
             word = words[word_id]
@@ -77,7 +158,7 @@ def train_bpe(
             
             i = 0
             while i < len(word) - 1:
-                if word[i] == best_pair[0] and word[i + 1] == best_pair[1]:
+                if word[i] == most_pair[0] and word[i + 1] == most_pair[1]:
                     # 移除受影响的pairs
                     if i > 0:
                         left_pair = (word[i - 1], word[i])
@@ -85,15 +166,14 @@ def train_bpe(
                             pair_counts[left_pair] -= freq
                             if pair_counts[left_pair] <= 0:
                                 del pair_counts[left_pair]
-                                pair_to_words.pop(left_pair, None)
-                    
+                                pair_in_words.pop(left_pair, None)
                     if i + 2 < len(word):
                         right_pair = (word[i + 1], word[i + 2])
                         if right_pair in pair_counts:
                             pair_counts[right_pair] -= freq
                             if pair_counts[right_pair] <= 0:
                                 del pair_counts[right_pair]
-                                pair_to_words.pop(right_pair, None)
+                                pair_in_words.pop(right_pair, None)
                     
                     # 执行合并
                     word[i] = new_token
@@ -103,20 +183,28 @@ def train_bpe(
                     if i > 0:
                         new_left_pair = (word[i - 1], new_token)
                         pair_counts[new_left_pair] += freq
-                        pair_to_words[new_left_pair].add(word_id)
-                    
+                        pair_in_words[new_left_pair].add(word_id)
+                        
                     if i + 1 < len(word):
                         new_right_pair = (new_token, word[i + 1])
                         pair_counts[new_right_pair] += freq
-                        pair_to_words[new_right_pair].add(word_id)
+                        pair_in_words[new_right_pair].add(word_id)
+                        
                 else:
                     i += 1
-    
     return vocab, merges
-
-
+ 
 class BPETokenizer:
-    """BPE Tokenizer 实现"""
+    """
+    BPE Tokenizer 实现
+    
+    支持内存高效的流式编码：
+    - encode: 标准编码方法
+    - encode_iterable: 流式编码，内存复杂度为O(1)
+    
+    流式编码的关键是在预分词边界处分割文本，确保token不会跨越chunk边界。
+    对于大文件，我们逐块处理，并在块之间保留可能不完整的预分词。
+    """
     
     def __init__(
         self,
@@ -186,9 +274,20 @@ class BPETokenizer:
                 break
             
             new_token = word[min_idx] + word[min_idx + 1]
-            word = word[:min_idx] + [new_token] + word[min_idx + 2:]
+            word[min_idx] = new_token
+            del word[min_idx + 1]
         
         return word
+    
+    def _encode_pretoken(self, pretoken: str) -> list[int]:
+        """对单个预分词进行BPE编码"""
+        token_bytes = tuple(bytes([b]) for b in pretoken.encode("utf-8"))
+        merged = self._apply_bpe(token_bytes)
+        ids = []
+        for token in merged:
+            if token in self.token_to_id:
+                ids.append(self.token_to_id[token])
+        return ids
     
     def encode(self, text: str) -> list[int]:
         if not text:
@@ -208,11 +307,7 @@ class BPETokenizer:
             else:
                 for match in self.pretokenize_pattern.finditer(segment):
                     pretoken = match.group()
-                    token_bytes = tuple(bytes([b]) for b in pretoken.encode("utf-8"))
-                    merged = self._apply_bpe(token_bytes)
-                    for token in merged:
-                        if token in self.token_to_id:
-                            ids.append(self.token_to_id[token])
+                    ids.extend(self._encode_pretoken(pretoken))
         
         return ids
     
@@ -225,10 +320,97 @@ class BPETokenizer:
         all_bytes = b"".join(byte_list)
         return all_bytes.decode("utf-8", errors="replace")
     
-    def encode_iterable(self, iterable) :
-        for text in iterable:
-            for id in self.encode(text):
-                yield id
+    def encode_iterable(self, iterable):
+        """
+        内存高效的流式编码
+        
+        对于大文件，使用迭代器逐块处理，确保内存复杂度为O(1)。
+        关键是在预分词边界处分割，确保token不会跨越chunk边界。
+        
+        算法:
+        1. 对每个chunk，与上一个chunk末尾的carry_over合并
+        2. 按特殊token分割文本
+        3. 对普通文本进行预分词匹配
+        4. 除了最后一个预分词外，其他都直接编码
+        5. 最后一个预分词可能不完整，保留到下一个chunk
+        
+        Args:
+            iterable: 可迭代对象，每个元素是一个文本块（字符串）
+            
+        Yields:
+            token ID
+        """
+        carry_over = ""
+        
+        for chunk in iterable:
+            # 合并carry_over和当前chunk
+            text = carry_over + chunk
+            carry_over = ""
+            
+            if not text:
+                continue
+            
+            # 按特殊token分割
+            segments = self._split_by_special_tokens(text)
+            
+            # 处理每个segment
+            for i, (segment, is_special) in enumerate(segments):
+                if not segment:
+                    continue
+                
+                is_last_segment = (i == len(segments) - 1)
+                
+                if is_special:
+                    token_bytes = segment.encode("utf-8")
+                    if token_bytes in self.token_to_id:
+                        yield self.token_to_id[token_bytes]
+                else:
+                    # 预分词
+                    matches = list(self.pretokenize_pattern.finditer(segment))
+                    
+                    if not matches:
+                        if is_last_segment:
+                            # 没有匹配到预分词，可能是不完整的，保留
+                            carry_over = segment
+                        continue
+                    
+                    # 检查segment末尾是否被完全匹配
+                    last_match = matches[-1]
+                    fully_matched = (last_match.end() == len(segment))
+                    
+                    for j, match in enumerate(matches):
+                        is_last_match = (j == len(matches) - 1)
+                        pretoken = match.group()
+                        
+                        if is_last_segment and is_last_match and fully_matched:
+                            # 最后一个segment的最后一个预分词，且匹配到了末尾
+                            # 这个预分词可能不完整，保留到下一个chunk
+                            carry_over = pretoken
+                        else:
+                            # 编码当前预分词
+                            for token_id in self._encode_pretoken(pretoken):
+                                yield token_id
+                    
+                    # 如果segment末尾有未匹配的文本，保留它
+                    if is_last_segment and not fully_matched:
+                        carry_over = segment[last_match.end():]
+        
+        # 处理最后的carry_over
+        if carry_over:
+            # 按特殊token分割
+            segments = self._split_by_special_tokens(carry_over)
+            for segment, is_special in segments:
+                if not segment:
+                    continue
+                if is_special:
+                    token_bytes = segment.encode("utf-8")
+                    if token_bytes in self.token_to_id:
+                        yield self.token_to_id[token_bytes]
+                else:
+                    for match in self.pretokenize_pattern.finditer(segment):
+                        pretoken = match.group()
+                        for token_id in self._encode_pretoken(pretoken):
+                            yield token_id
     
     @classmethod
     def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None):
@@ -251,3 +433,6 @@ class BPETokenizer:
                 merges.append((part1, part2))
         
         return cls(vocab, merges, special_tokens)
+                
+        
+
