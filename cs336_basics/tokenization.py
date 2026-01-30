@@ -1,9 +1,12 @@
 import os
+import json
+import pickle
 from typing import BinaryIO
 import regex as re
 from collections import defaultdict, Counter
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import cpu_count
+from pathlib import Path
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -413,26 +416,25 @@ class BPETokenizer:
                             yield token_id
     
     @classmethod
-    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None):
+    def from_files(cls, path: str | os.PathLike):
         """从文件加载BPE Tokenizer"""
-        vocab: dict[int, bytes] = {}
-        with open(vocab_filepath, "rb") as vf:
-            for line in vf:
-                line = line.rstrip(b"\n")
-                token_id_str, token_bytes = line.split(b"\t")
-                token_id = int(token_id_str)
-                vocab[token_id] = token_bytes
-        
-        merges: list[tuple[bytes, bytes]] = []
-        with open(merges_filepath, "rb") as mf:
-            for line in mf:
-                line = line.rstrip(b"\n")
-                if not line or line.startswith(b"#"):
-                    continue
-                part1, part2 = line.split(b" ")
-                merges.append((part1, part2))
-        
-        return cls(vocab, merges, special_tokens)
+        path = Path(path)
+        if path.suffix == '.pkl':
+            with open(path, 'rb') as f:
+                return pickle.load(f)
+        elif path.suffix == '.json':
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            vocab = {int(k): bytes.fromhex(v) for k, v in data['vocab'].items()}
+            merges = [(bytes.fromhex(pair[0]), bytes.fromhex(pair[1])) for pair in data['merges']]
+            special_tokens = data.get('special_tokens', [])
+            return cls(vocab, merges, special_tokens)
+            
+    
+    def save_to_files(self, path: str | os.PathLike):
+        """将BPE Tokenizer保存到文件"""
+        pass
+            
                 
         
 
